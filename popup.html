@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Twitch Prediction Alerts</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      width: 280px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 15px;
+      color: #1d1d1f;
+      background: #f5f5f7;
+      -webkit-font-smoothing: antialiased;
+    }
+    header {
+      padding: 16px 18px 12px;
+      background: #fff;
+      border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+    }
+    h1 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    p.sub {
+      margin: 4px 0 0;
+      font-size: 12px;
+      color: #86868b;
+      font-weight: 400;
+    }
+    main {
+      padding: 8px 12px 14px;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 12px 14px;
+      margin: 6px 0;
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    }
+    .row-label {
+      flex: 1;
+      font-weight: 500;
+      letter-spacing: -0.01em;
+    }
+    .switch {
+      position: relative;
+      width: 51px;
+      height: 31px;
+      flex-shrink: 0;
+    }
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+      position: absolute;
+    }
+    .track {
+      position: absolute;
+      inset: 0;
+      border-radius: 31px;
+      background: #e9e9eb;
+      transition: background 0.22s ease;
+    }
+    .thumb {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 27px;
+      height: 27px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow:
+        0 3px 8px rgba(0, 0, 0, 0.15),
+        0 1px 1px rgba(0, 0, 0, 0.06);
+      transition: transform 0.22s cubic-bezier(0.34, 1.1, 0.64, 1);
+    }
+    .switch input:checked + .track {
+      background: #34c759;
+    }
+    .switch input:checked + .track .thumb {
+      transform: translateX(20px);
+    }
+    .switch input:focus-visible + .track {
+      outline: 2px solid #007aff;
+      outline-offset: 2px;
+    }
+    footer {
+      padding: 0 18px 14px;
+      font-size: 11px;
+      color: #86868b;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Twitch Prediction Alerts</h1>
+    <p class="sub">Works on twitch.tv while you watch</p>
+  </header>
+  <main>
+    <div class="row">
+      <span class="row-label" id="lbl-prediction">Prediction Sound</span>
+      <label class="switch" for="predictionSound">
+        <input type="checkbox" id="predictionSound" checked aria-labelledby="lbl-prediction" />
+        <span class="track"><span class="thumb"></span></span>
+      </label>
+    </div>
+    <div class="row">
+      <span class="row-label" id="lbl-claim">Auto Claim</span>
+      <label class="switch" for="autoClaim">
+        <input type="checkbox" id="autoClaim" checked aria-labelledby="lbl-claim" />
+        <span class="track"><span class="thumb"></span></span>
+      </label>
+    </div>
+  </main>
+  <footer>Applies immediately on open Twitch tabs</footer>
+  <script src="popup.js"></script>
+</body>
+</html>
