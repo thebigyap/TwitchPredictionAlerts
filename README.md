@@ -10,7 +10,8 @@ OPTION 1. Edge/Chrome Extension:
 
 OPTION 2. Manually installing:
 1. Download repository
-2. Open `edge://extensions`
-3. Turn on **Developer mode**
-4. Click **Load unpacked**
-5. Select the downloaded folder
+2. Extract zip
+3. Open `edge://extensions`
+4. Turn on **Developer mode**
+5. Click **Load unpacked**
+6. Select the extracted folder
