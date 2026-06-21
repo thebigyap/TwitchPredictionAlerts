@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Twitch Prediction Alerts",
   "description": "Detects Twitch prediction events and plays an alert sound.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "permissions": ["storage"],
   "action": {
     "default_title": "Twitch Prediction Alerts",
@@ -22,7 +22,8 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "sounds/alert.mp3"
+        "sounds/alert.mp3",
+        "sounds/countdown.mp3"
       ],
       "matches": [
         "https://www.twitch.tv/*"
