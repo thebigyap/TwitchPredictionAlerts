@@ -13,24 +13,11 @@
   const PREDICTION_ALERT_COOLDOWN_MS = 10_000;
   const PREDICTION_MISSING_RESET_MS = 2 * 60_000;
   const PREDICTION_SCAN_INTERVAL_MS = 1_000;
-  // Re-check the wall-clock countdown 4x a second so every whole-second value
-  // (10..1) plays. The deadline is only ever anchored from the readable timer
-  // text — never guessed from the progress bar.
   const COUNTDOWN_TICK_INTERVAL_MS = 250;
-  // Cap how often we re-search the whole page for the timer element when it
-  // isn't already cached, so a chatty page doesn't trigger constant lookups.
-  const COUNTDOWN_LOCATE_INTERVAL_MS = 1_000;
-  // How long the prediction card must be absent (no timer text and nothing in
-  // the region scan) before we stop a running countdown — covers a mod
-  // canceling the prediction mid-countdown.
-  const COUNTDOWN_PRESENCE_GRACE_MS = 4_000;
-  // How long the prediction must be gone before the once-per-prediction alert
-  // re-arms for the next one.
-  const PREDICTION_ALERT_REARM_MS = 10_000;
-  // Seconds to fire the countdown early. Testing showed the on-screen
-  // "Submissions closing in M:SS" timer is accurate to the real deadline, so 0.
-  // Kept as a tunable knob in case a future Twitch change reintroduces an offset.
-  const COUNTDOWN_DEADLINE_OFFSET_SECONDS = 0;
+  const COUNTDOWN_LOCATE_INTERVAL_MS = 1_000; // throttle the page-wide timer search
+  const COUNTDOWN_PRESENCE_GRACE_MS = 4_000; // card absent this long -> stop countdown
+  const PREDICTION_ALERT_REARM_MS = 10_000; // prediction gone this long -> alert can fire again
+  const COUNTDOWN_DEADLINE_OFFSET_SECONDS = 0; // fire the countdown N seconds early (timer is accurate, so 0)
   const COUNTDOWN_THRESHOLD_SECONDS = 10;
   const BONUS_CLAIM_COOLDOWN_MS = 4_000;
   const BONUS_DELAY_MIN_SECONDS = 5;
@@ -47,22 +34,18 @@
   let pendingBonusClaimTimeout = null;
   let lastPredictionAlertAt = 0;
   let activePredictionKey = null;
-  // Timestamp of the last time any prediction signal was seen (region scan or
-  // the readable timer text). Drives countdown-stop and alert re-arm.
+  // Last time any prediction signal was seen (region scan or timer text).
+  // Drives countdown-stop and alert re-arm.
   let predictionLastSeenAt = 0;
   let alertedThisRun = false;
-  let lastSeenAlertableKey = null;
   let countdownElement = null;
   let lastCountdownLocateAt = 0;
-  let lastDebugSecond = null;
-  // Wall-clock countdown: once we read the timer text we anchor a deadline and
-  // tick against it, so the final 10s still plays through a brief panel
-  // collapse. Only ever anchored from the text — never guessed.
+  // Wall-clock countdown: anchor a deadline from the timer text and tick against
+  // it, so the final 10s still plays through a brief panel collapse.
   let countdownDeadlineAt = 0;
   let countdownPlayedSecond = Infinity;
-  // Once the final-10s countdown starts it is "committed": the deadline is
-  // locked and plays out tick-by-tick, ignoring re-reads of the timer and
-  // presence/cancellation, so it can never double a tick or be cut short.
+  // In the final 10s the countdown is "committed": deadline locked, plays out
+  // tick-by-tick ignoring timer re-reads and cancellation (never doubles/cuts).
   let countdownCommitted = false;
   let pendingScan = false;
 
@@ -161,11 +144,8 @@
     return normalizeText(text).includes("submissions closing in");
   }
 
-  // Recognizes that a prediction card is on screen. Crucially this includes the
-  // collapsed card, which shows "Predict with Channel Points" but no timer — so
-  // the presence run stays alive (alert doesn't re-fire, countdown isn't cut
-  // short) while the panel is collapsed. Also covers the locked/closed/awaiting-
-  // result states through the close transition.
+  // A prediction card is on screen. Includes the collapsed card ("Predict with
+  // Channel Points", no timer) so presence survives collapsing the panel.
   function isPredictionPresenceText(text) {
     const normalized = normalizeText(text);
     return (
@@ -261,27 +241,17 @@
 
     let key = buildPredictionKey(text, pathHint, alertable);
     if (!key && (hasCountdown || isPresent)) {
-      // The bare timer text ("Submissions closing in 0:09") has no title to
-      // build an identity from, so reuse the active prediction's key. Fall back
-      // to a channel-scoped key when there is no active key (e.g. a long
-      // prediction whose key already aged out) so the countdown can still fire.
+      // Bare timer/presence text has no title to key on; reuse the active key.
       key = activePredictionKey || `${getChannelKey()}|active-prediction`;
     }
     if (!key) {
       return null;
     }
 
-    return {
-      key,
-      alertable,
-      remainingSeconds,
-      sample: DEBUG ? normalizeText(text).slice(0, 160) : null
-    };
+    return { key, alertable, remainingSeconds };
   }
 
-  // Any reading of how many seconds remain (from the region scan or the timer
-  // text) just anchors the local clock. The actual per-second playback happens
-  // in tickCountdown so it survives the timer becoming unreadable.
+  // A remaining-seconds reading only anchors the clock; tickCountdown plays.
   function handlePredictionCountdown(prediction) {
     if (!opts.predictionCountdown) {
       return;
@@ -293,8 +263,6 @@
     if (!Number.isFinite(seconds) || seconds < 0) {
       return;
     }
-    // The on-screen timer overshoots the real submission deadline, so shift the
-    // deadline earlier by the offset.
     countdownDeadlineAt = now + (seconds - COUNTDOWN_DEADLINE_OFFSET_SECONDS) * 1000;
   }
 
@@ -312,16 +280,8 @@
       return false;
     }
 
-    if (prediction.key !== lastSeenAlertableKey) {
-      lastSeenAlertableKey = prediction.key;
-      dbg("alertable seen | alertedThisRun:", alertedThisRun, "| key:", prediction.key, "| text:", prediction.sample);
-    }
-
-    // Alert once per prediction "presence run". The run stays alive as long as
-    // the card is detected (region scan — works collapsed too) and re-arms once
-    // it has been gone for PREDICTION_ALERT_REARM_MS (handled in
-    // updatePredictionPresence). Immune to the card's identity text churning as
-    // votes come in, which was causing the alert to re-fire every cooldown.
+    // Alert once per "presence run": re-arms in updatePredictionPresence after
+    // the card is gone. Robust to the card's identity text churning with votes.
     const canPlayAlert =
       !alertedThisRun && now - lastPredictionAlertAt >= PREDICTION_ALERT_COOLDOWN_MS;
 
@@ -334,21 +294,17 @@
     return canPlayAlert;
   }
 
-  // Reacts to the prediction card disappearing: stops a running countdown soon
-  // after the card is gone, then re-arms the once-per-prediction alert a little
-  // later so the next prediction sounds again.
+  // Card gone: stop a running countdown (grace), then re-arm the alert (longer),
+  // then drop the stale key. Skipped while the countdown is committed.
   function updatePredictionPresence(now) {
     const missingFor = predictionLastSeenAt ? now - predictionLastSeenAt : Infinity;
 
     if (countdownDeadlineAt && missingFor >= COUNTDOWN_PRESENCE_GRACE_MS) {
-      dbg("prediction gone — countdown stopped");
       countdownDeadlineAt = 0;
       countdownPlayedSecond = Infinity;
-      lastDebugSecond = null;
     }
 
     if (alertedThisRun && missingFor >= PREDICTION_ALERT_REARM_MS) {
-      dbg("prediction gone — alert re-armed");
       alertedThisRun = false;
     }
 
@@ -389,10 +345,8 @@
     return false;
   }
 
-  // Locates the prediction's closing-timer text anywhere on the page. The
-  // region scan only looks inside dialog/aria-live/section/article wrappers,
-  // which can miss the prediction card; this searches by the timer's own text
-  // so the per-second countdown is read no matter where the card lives.
+  // Finds the closing-timer text anywhere on the page (the region scan only
+  // looks inside specific wrappers and can miss the card). Cached + throttled.
   function findCountdownText() {
     if (countdownElement && countdownElement.isConnected) {
       const cachedText = countdownElement.textContent || "";
@@ -421,8 +375,7 @@
         XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
         null
       );
-      // Every ancestor up to <body> matches; keep the most specific (shortest
-      // text) one so parsing sees a tight timer string.
+      // All ancestors match; keep the shortest (tightest timer string).
       for (let i = 0; i < snapshot.snapshotLength; i++) {
         const candidate = snapshot.snapshotItem(i);
         if (!(candidate instanceof Element)) {
@@ -451,14 +404,12 @@
       second < countdownPlayedSecond
     ) {
       countdownPlayedSecond = second;
-      dbg("PLAY countdown sound:", second);
       void playCountdownSound();
     }
   }
 
-  // Runs whenever alerts or the countdown are enabled. Anchors the wall-clock
-  // deadline from the readable timer text, reacts to the card disappearing, and
-  // plays the per-second countdown. Playback is gated inside playCountdownSound.
+  // Anchors the wall-clock deadline from the timer text, reacts to the card
+  // disappearing, and plays the per-second countdown.
   function tickCountdown() {
     const now = Date.now();
 
@@ -466,14 +417,12 @@
     const textSeconds = text ? parsePredictionRemainingSeconds(text) : null;
     if (Number.isFinite(textSeconds)) {
       predictionLastSeenAt = now;
-      // Once committed, never re-anchor — re-reading the timer (e.g. opening the
-      // panel) must not shift the locked deadline and double a tick.
+      // Committed: don't re-anchor, or opening the panel could double a tick.
       if (!countdownCommitted) {
         anchorCountdownSeconds(textSeconds, now);
       }
     }
 
-    // While committed, ignore presence/cancellation so the countdown plays out.
     if (!countdownCommitted) {
       updatePredictionPresence(now);
     }
@@ -483,8 +432,7 @@
       displaySecond = Math.ceil((countdownDeadlineAt - now) / 1000);
     }
 
-    // Lock the countdown the moment it enters the final window with a real
-    // deadline, so the remaining ticks play uninterrupted.
+    // Entering the final window locks the countdown so it plays out uninterrupted.
     if (
       !countdownCommitted &&
       displaySecond !== null &&
@@ -492,34 +440,20 @@
       displaySecond <= COUNTDOWN_THRESHOLD_SECONDS
     ) {
       countdownCommitted = true;
-      dbg("countdown committed — playing out uninterrupted");
-    }
-
-    if (displaySecond !== null && displaySecond !== lastDebugSecond) {
-      lastDebugSecond = displaySecond;
-      // Only log the final stretch each second, plus a 30s heartbeat earlier,
-      // so long predictions don't flood the console.
-      if (displaySecond <= 30 || displaySecond % 30 === 0) {
-        dbg("remaining:", displaySecond, "| rawText:", textSeconds);
-      }
     }
 
     if (displaySecond !== null) {
-      // Before commit, a jump up to a longer timer means a new prediction
-      // started; re-arm the per-second dedup so its countdown plays too.
+      // Before commit, a jump up to a longer timer = new prediction; reset dedup.
       if (!countdownCommitted && displaySecond > countdownPlayedSecond + 2) {
         countdownPlayedSecond = Infinity;
       }
       maybePlayCountdownSecond(displaySecond);
     }
 
-    // Committed countdown reached zero: release the lock and reset for the next.
     if (countdownCommitted && displaySecond !== null && displaySecond <= 0) {
-      dbg("countdown finished");
       countdownCommitted = false;
       countdownDeadlineAt = 0;
       countdownPlayedSecond = Infinity;
-      lastDebugSecond = null;
     }
   }
 
@@ -528,8 +462,7 @@
       "[role='dialog'], [aria-live='polite'], [aria-live='assertive'], section, article"
     );
 
-    // inspectPredictionText -> notePredictionSeen refreshes predictionLastSeenAt
-    // whenever a prediction is found, which keeps the presence timer alive.
+    // inspectPredictionText -> notePredictionSeen refreshes the presence timer.
     for (const candidate of candidates) {
       const result = inspectPredictionText(
         candidate.textContent || "",
@@ -684,7 +617,6 @@
   function init() {
     chrome.storage.local.get(STORAGE_DEFAULTS, (items) => {
       applyStorage(items);
-      dbg("content script loaded", { sound: opts.predictionSound, countdown: opts.predictionCountdown });
       startObserver();
       triggerScan();
       window.setInterval(() => {
