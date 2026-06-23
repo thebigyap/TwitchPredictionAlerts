@@ -9,7 +9,7 @@
   const ALERT_SOUND_PATH = "sounds/alert.mp3";
   const COUNTDOWN_SOUND_PATH = "sounds/countdown.mp3";
   // Flip to false to silence the console diagnostics.
-  const DEBUG = true;
+  const DEBUG = false;
   const PREDICTION_ALERT_COOLDOWN_MS = 10_000;
   const PREDICTION_MISSING_RESET_MS = 2 * 60_000;
   const PREDICTION_SCAN_INTERVAL_MS = 1_000;
@@ -60,6 +60,10 @@
   // collapse. Only ever anchored from the text — never guessed.
   let countdownDeadlineAt = 0;
   let countdownPlayedSecond = Infinity;
+  // Once the final-10s countdown starts it is "committed": the deadline is
+  // locked and plays out tick-by-tick, ignoring re-reads of the timer and
+  // presence/cancellation, so it can never double a tick or be cut short.
+  let countdownCommitted = false;
   let pendingScan = false;
 
   function dbg(...args) {
@@ -461,15 +465,34 @@
     const text = findCountdownText();
     const textSeconds = text ? parsePredictionRemainingSeconds(text) : null;
     if (Number.isFinite(textSeconds)) {
-      anchorCountdownSeconds(textSeconds, now);
       predictionLastSeenAt = now;
+      // Once committed, never re-anchor — re-reading the timer (e.g. opening the
+      // panel) must not shift the locked deadline and double a tick.
+      if (!countdownCommitted) {
+        anchorCountdownSeconds(textSeconds, now);
+      }
     }
 
-    updatePredictionPresence(now);
+    // While committed, ignore presence/cancellation so the countdown plays out.
+    if (!countdownCommitted) {
+      updatePredictionPresence(now);
+    }
 
     let displaySecond = null;
     if (countdownDeadlineAt) {
       displaySecond = Math.ceil((countdownDeadlineAt - now) / 1000);
+    }
+
+    // Lock the countdown the moment it enters the final window with a real
+    // deadline, so the remaining ticks play uninterrupted.
+    if (
+      !countdownCommitted &&
+      displaySecond !== null &&
+      displaySecond >= 1 &&
+      displaySecond <= COUNTDOWN_THRESHOLD_SECONDS
+    ) {
+      countdownCommitted = true;
+      dbg("countdown committed — playing out uninterrupted");
     }
 
     if (displaySecond !== null && displaySecond !== lastDebugSecond) {
@@ -482,12 +505,21 @@
     }
 
     if (displaySecond !== null) {
-      // A jump up to a longer timer means a new prediction started; re-arm the
-      // per-second dedup so its countdown plays too.
-      if (displaySecond > countdownPlayedSecond + 2) {
+      // Before commit, a jump up to a longer timer means a new prediction
+      // started; re-arm the per-second dedup so its countdown plays too.
+      if (!countdownCommitted && displaySecond > countdownPlayedSecond + 2) {
         countdownPlayedSecond = Infinity;
       }
       maybePlayCountdownSecond(displaySecond);
+    }
+
+    // Committed countdown reached zero: release the lock and reset for the next.
+    if (countdownCommitted && displaySecond !== null && displaySecond <= 0) {
+      dbg("countdown finished");
+      countdownCommitted = false;
+      countdownDeadlineAt = 0;
+      countdownPlayedSecond = Infinity;
+      lastDebugSecond = null;
     }
   }
 
