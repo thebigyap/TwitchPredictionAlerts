@@ -13,24 +13,24 @@
   const PREDICTION_ALERT_COOLDOWN_MS = 10_000;
   const PREDICTION_MISSING_RESET_MS = 2 * 60_000;
   const PREDICTION_SCAN_INTERVAL_MS = 1_000;
-  // Drive the countdown from a local wall-clock and re-check it 4x a second so
-  // every whole-second value (10..1) plays even when the on-screen timer is not
-  // currently readable (e.g. the prediction card is collapsed).
+  // Re-check the wall-clock countdown 4x a second so every whole-second value
+  // (10..1) plays. The deadline is only ever anchored from the readable timer
+  // text — never guessed from the progress bar.
   const COUNTDOWN_TICK_INTERVAL_MS = 250;
   // Cap how often we re-search the whole page for the timer element when it
   // isn't already cached, so a chatty page doesn't trigger constant lookups.
   const COUNTDOWN_LOCATE_INTERVAL_MS = 1_000;
-  // If no prediction signal (timer text or progress bar) is seen for this long,
-  // the card vanished mid-life — a mod canceled the prediction — so stop ticking.
-  const COUNTDOWN_CANCEL_GRACE_MS = 1_500;
-  // Minimum spacing between progress-bar samples used to estimate the remaining
-  // time from the bar's rate of movement when no timer text is available.
-  const COUNTDOWN_BAR_MIN_SPAN_MS = 750;
-  // The purple submission-progress bar. Present even when the card is collapsed,
-  // so it doubles as a "prediction still exists" signal.
-  const COUNTDOWN_BAR_XPATH =
-    '//*[@id="live-page-chat"]/div/div/div[2]/div/div[2]/section/div/div[3]' +
-    "/div[1]/div/div[2]/div/div/div[1]/div/div/div/div/div/div/div[2]";
+  // How long the prediction card must be absent (no timer text and nothing in
+  // the region scan) before we stop a running countdown — covers a mod
+  // canceling the prediction mid-countdown.
+  const COUNTDOWN_PRESENCE_GRACE_MS = 4_000;
+  // How long the prediction must be gone before the once-per-prediction alert
+  // re-arms for the next one.
+  const PREDICTION_ALERT_REARM_MS = 10_000;
+  // Seconds to fire the countdown early. Testing showed the on-screen
+  // "Submissions closing in M:SS" timer is accurate to the real deadline, so 0.
+  // Kept as a tunable knob in case a future Twitch change reintroduces an offset.
+  const COUNTDOWN_DEADLINE_OFFSET_SECONDS = 0;
   const COUNTDOWN_THRESHOLD_SECONDS = 10;
   const BONUS_CLAIM_COOLDOWN_MS = 4_000;
   const BONUS_DELAY_MIN_SECONDS = 5;
@@ -47,24 +47,19 @@
   let pendingBonusClaimTimeout = null;
   let lastPredictionAlertAt = 0;
   let activePredictionKey = null;
-  let activePredictionMissingSince = 0;
+  // Timestamp of the last time any prediction signal was seen (region scan or
+  // the readable timer text). Drives countdown-stop and alert re-arm.
+  let predictionLastSeenAt = 0;
   let alertedThisRun = false;
   let lastSeenAlertableKey = null;
   let countdownElement = null;
   let lastCountdownLocateAt = 0;
   let lastDebugSecond = null;
-  // Local countdown clock + presence tracking. Once we learn how many seconds
-  // remain (from text, the region scan, or the progress bar) we anchor a
-  // deadline and tick against the wall clock, so audio keeps firing without the
-  // timer staying visible.
+  // Wall-clock countdown: once we read the timer text we anchor a deadline and
+  // tick against it, so the final 10s still plays through a brief panel
+  // collapse. Only ever anchored from the text — never guessed.
   let countdownDeadlineAt = 0;
   let countdownPlayedSecond = Infinity;
-  let countdownSessionActive = false;
-  let countdownAbsentSince = 0;
-  let countdownBarElement = null;
-  let lastBarLocateAt = 0;
-  let countdownBarSampleOld = null;
-  let countdownBarSampleNew = null;
   let pendingScan = false;
 
   function dbg(...args) {
@@ -162,13 +157,15 @@
     return normalizeText(text).includes("submissions closing in");
   }
 
-  // Recognizes a prediction card that is still on screen but no longer taking
-  // submissions (locked / closed / awaiting result). This keeps the current
-  // prediction "session" alive through the close transition so we don't treat
-  // the post-close text as a brand-new prediction and alert again.
+  // Recognizes that a prediction card is on screen. Crucially this includes the
+  // collapsed card, which shows "Predict with Channel Points" but no timer — so
+  // the presence run stays alive (alert doesn't re-fire, countdown isn't cut
+  // short) while the panel is collapsed. Also covers the locked/closed/awaiting-
+  // result states through the close transition.
   function isPredictionPresenceText(text) {
     const normalized = normalizeText(text);
     return (
+      normalized.includes("predict with channel points") ||
       normalized.includes("submissions closing in") ||
       normalized.includes("submissions closed") ||
       normalized.includes("submissions locked")
@@ -292,17 +289,18 @@
     if (!Number.isFinite(seconds) || seconds < 0) {
       return;
     }
-    countdownDeadlineAt = now + seconds * 1000;
+    // The on-screen timer overshoots the real submission deadline, so shift the
+    // deadline earlier by the offset.
+    countdownDeadlineAt = now + (seconds - COUNTDOWN_DEADLINE_OFFSET_SECONDS) * 1000;
   }
 
   function notePredictionSeen(prediction) {
     const now = Date.now();
-    cleanupPredictionState(now);
+    predictionLastSeenAt = now;
 
     if (activePredictionKey !== prediction.key) {
       activePredictionKey = prediction.key;
     }
-    activePredictionMissingSince = 0;
 
     handlePredictionCountdown(prediction);
 
@@ -315,12 +313,11 @@
       dbg("alertable seen | alertedThisRun:", alertedThisRun, "| key:", prediction.key, "| text:", prediction.sample);
     }
 
-    // Alert once per prediction "presence run". The run stays alive for the
-    // whole prediction because the closing-timer is on screen the entire time
-    // (tracked by the countdown subsystem), and only re-arms once the card is
-    // gone (resetCountdownTracking). This is immune to the prediction card's
-    // identity text churning as votes come in — which is what was causing the
-    // alert to re-fire every cooldown window.
+    // Alert once per prediction "presence run". The run stays alive as long as
+    // the card is detected (region scan — works collapsed too) and re-arms once
+    // it has been gone for PREDICTION_ALERT_REARM_MS (handled in
+    // updatePredictionPresence). Immune to the card's identity text churning as
+    // votes come in, which was causing the alert to re-fire every cooldown.
     const canPlayAlert =
       !alertedThisRun && now - lastPredictionAlertAt >= PREDICTION_ALERT_COOLDOWN_MS;
 
@@ -333,22 +330,27 @@
     return canPlayAlert;
   }
 
-  function cleanupPredictionState(now) {
-    if (
-      activePredictionKey &&
-      activePredictionMissingSince &&
-      now - activePredictionMissingSince > PREDICTION_MISSING_RESET_MS
-    ) {
-      activePredictionKey = null;
-      activePredictionMissingSince = 0;
-    }
-  }
+  // Reacts to the prediction card disappearing: stops a running countdown soon
+  // after the card is gone, then re-arms the once-per-prediction alert a little
+  // later so the next prediction sounds again.
+  function updatePredictionPresence(now) {
+    const missingFor = predictionLastSeenAt ? now - predictionLastSeenAt : Infinity;
 
-  function handleMissingPrediction(now) {
-    if (activePredictionKey && !activePredictionMissingSince) {
-      activePredictionMissingSince = now;
+    if (countdownDeadlineAt && missingFor >= COUNTDOWN_PRESENCE_GRACE_MS) {
+      dbg("prediction gone — countdown stopped");
+      countdownDeadlineAt = 0;
+      countdownPlayedSecond = Infinity;
+      lastDebugSecond = null;
     }
-    cleanupPredictionState(now);
+
+    if (alertedThisRun && missingFor >= PREDICTION_ALERT_REARM_MS) {
+      dbg("prediction gone — alert re-armed");
+      alertedThisRun = false;
+    }
+
+    if (activePredictionKey && missingFor > PREDICTION_MISSING_RESET_MS) {
+      activePredictionKey = null;
+    }
   }
 
   function inspectPredictionText(text, pathHint = "unknown") {
@@ -438,142 +440,6 @@
     return bestNode.textContent || "";
   }
 
-  function clamp01(value) {
-    if (value < 0) return 0;
-    if (value > 1) return 1;
-    return value;
-  }
-
-  // The purple progress bar exists even when the prediction card is collapsed,
-  // so it is both a presence signal and a text-free way to read the timer.
-  function getProgressBarElement() {
-    if (countdownBarElement && countdownBarElement.isConnected) {
-      return countdownBarElement;
-    }
-    countdownBarElement = null;
-    const now = Date.now();
-    if (now - lastBarLocateAt < COUNTDOWN_LOCATE_INTERVAL_MS) {
-      return null;
-    }
-    lastBarLocateAt = now;
-    try {
-      const result = document.evaluate(
-        COUNTDOWN_BAR_XPATH,
-        document,
-        null,
-        XPathResult.FIRST_ORDERED_NODE_TYPE,
-        null
-      );
-      if (result.singleNodeValue instanceof Element) {
-        countdownBarElement = result.singleNodeValue;
-      }
-    } catch (_) {}
-    return countdownBarElement;
-  }
-
-  // Reads the bar's fill as a 0..1 fraction, trying the encodings Twitch is
-  // likely to use (ARIA value, inline width/transform, then raw geometry).
-  function readBarFraction(element) {
-    if (!(element instanceof Element)) {
-      return null;
-    }
-
-    const valueNow = element.getAttribute("aria-valuenow");
-    const valueMax = element.getAttribute("aria-valuemax");
-    if (valueNow !== null && valueMax !== null) {
-      const now = Number(valueNow);
-      const min = Number(element.getAttribute("aria-valuemin") || 0);
-      const max = Number(valueMax);
-      if (Number.isFinite(now) && Number.isFinite(max) && max > min) {
-        return clamp01((now - min) / (max - min));
-      }
-    }
-
-    const width = element.style && element.style.width;
-    if (width && width.endsWith("%")) {
-      const pct = Number(width.slice(0, -1));
-      if (Number.isFinite(pct)) {
-        return clamp01(pct / 100);
-      }
-    }
-
-    const transform = element.style && element.style.transform;
-    if (transform) {
-      const scale = transform.match(/scaleX\(([\d.]+)\)/);
-      if (scale) {
-        const value = Number(scale[1]);
-        if (Number.isFinite(value)) {
-          return clamp01(value);
-        }
-      }
-    }
-
-    const parent = element.parentElement;
-    if (parent) {
-      const elementWidth = element.getBoundingClientRect().width;
-      const parentWidth = parent.getBoundingClientRect().width;
-      if (parentWidth > 0) {
-        return clamp01(elementWidth / parentWidth);
-      }
-    }
-
-    return null;
-  }
-
-  function updateBarSamples(fraction, now) {
-    const sample = { fraction, at: now };
-    if (!countdownBarSampleNew) {
-      countdownBarSampleOld = sample;
-      countdownBarSampleNew = sample;
-      return;
-    }
-    if (now - countdownBarSampleNew.at >= COUNTDOWN_BAR_MIN_SPAN_MS) {
-      countdownBarSampleOld = countdownBarSampleNew;
-    }
-    countdownBarSampleNew = sample;
-  }
-
-  // Estimates seconds remaining purely from how fast the bar is moving, so the
-  // countdown still works when the timer text is never rendered. Extrapolates
-  // the bar's linear motion to the point it empties (or fills).
-  function estimateBarRemainingSeconds() {
-    const older = countdownBarSampleOld;
-    const newer = countdownBarSampleNew;
-    if (!older || !newer) {
-      return null;
-    }
-    const spanSeconds = (newer.at - older.at) / 1000;
-    if (spanSeconds < COUNTDOWN_BAR_MIN_SPAN_MS / 1000) {
-      return null;
-    }
-    const delta = older.fraction - newer.fraction;
-    const slope = Math.abs(delta) / spanSeconds;
-    if (slope < 0.0005) {
-      return null;
-    }
-    const remaining = delta > 0 ? newer.fraction / slope : (1 - newer.fraction) / slope;
-    if (!Number.isFinite(remaining) || remaining < 0 || remaining > 600) {
-      return null;
-    }
-    return remaining;
-  }
-
-  function resetCountdownTracking() {
-    if (countdownSessionActive) {
-      dbg("prediction gone (resolved or canceled) — alert re-armed");
-    }
-    countdownSessionActive = false;
-    countdownAbsentSince = 0;
-    countdownDeadlineAt = 0;
-    countdownPlayedSecond = Infinity;
-    countdownBarElement = null;
-    countdownBarSampleOld = null;
-    countdownBarSampleNew = null;
-    lastDebugSecond = null;
-    // The prediction card is gone, so the next one is allowed to alert again.
-    alertedThisRun = false;
-  }
-
   function maybePlayCountdownSecond(second) {
     if (
       second >= 1 &&
@@ -586,67 +452,24 @@
     }
   }
 
-  // Runs whenever alerts or the countdown are enabled: it tracks prediction
-  // presence (which arms/re-arms the once-per-run alert) and plays the per-second
-  // countdown. Countdown playback is gated separately inside playCountdownSound.
+  // Runs whenever alerts or the countdown are enabled. Anchors the wall-clock
+  // deadline from the readable timer text, reacts to the card disappearing, and
+  // plays the per-second countdown. Playback is gated inside playCountdownSound.
   function tickCountdown() {
     const now = Date.now();
 
     const text = findCountdownText();
     const textSeconds = text ? parsePredictionRemainingSeconds(text) : null;
-    const hasTextSeconds = Number.isFinite(textSeconds);
-
-    const barElement = getProgressBarElement();
-    const barFraction = barElement ? readBarFraction(barElement) : null;
-    if (barFraction !== null) {
-      updateBarSamples(barFraction, now);
+    if (Number.isFinite(textSeconds)) {
+      anchorCountdownSeconds(textSeconds, now);
+      predictionLastSeenAt = now;
     }
 
-    const present = hasTextSeconds || barElement !== null;
-
-    if (!present) {
-      if (countdownSessionActive) {
-        if (!countdownAbsentSince) {
-          countdownAbsentSince = now;
-        } else if (now - countdownAbsentSince > COUNTDOWN_CANCEL_GRACE_MS) {
-          // No timer text and no progress bar: the prediction card is gone
-          // (resolved, or a mod canceled it). Stop so we don't keep ticking.
-          resetCountdownTracking();
-        }
-      }
-      return;
-    }
-
-    countdownAbsentSince = 0;
-    if (!countdownSessionActive) {
-      countdownSessionActive = true;
-      countdownPlayedSecond = Infinity;
-      countdownDeadlineAt = 0;
-      countdownBarSampleOld = null;
-      countdownBarSampleNew = null;
-      lastDebugSecond = null;
-      dbg("prediction present — countdown armed", {
-        text: hasTextSeconds,
-        bar: barElement !== null
-      });
-    }
+    updatePredictionPresence(now);
 
     let displaySecond = null;
-    let source = null;
-    if (hasTextSeconds) {
-      anchorCountdownSeconds(textSeconds, now);
-      displaySecond = textSeconds;
-      source = "text";
-    } else if (countdownDeadlineAt) {
+    if (countdownDeadlineAt) {
       displaySecond = Math.ceil((countdownDeadlineAt - now) / 1000);
-      source = "clock";
-    } else {
-      const barSeconds = estimateBarRemainingSeconds();
-      if (barSeconds !== null) {
-        anchorCountdownSeconds(barSeconds, now);
-        displaySecond = Math.ceil(barSeconds);
-        source = "bar";
-      }
     }
 
     if (displaySecond !== null && displaySecond !== lastDebugSecond) {
@@ -654,11 +477,16 @@
       // Only log the final stretch each second, plus a 30s heartbeat earlier,
       // so long predictions don't flood the console.
       if (displaySecond <= 30 || displaySecond % 30 === 0) {
-        dbg("remaining:", displaySecond, "via", source, "| barFraction:", barFraction);
+        dbg("remaining:", displaySecond, "| rawText:", textSeconds);
       }
     }
 
     if (displaySecond !== null) {
+      // A jump up to a longer timer means a new prediction started; re-arm the
+      // per-second dedup so its countdown plays too.
+      if (displaySecond > countdownPlayedSecond + 2) {
+        countdownPlayedSecond = Infinity;
+      }
       maybePlayCountdownSecond(displaySecond);
     }
   }
@@ -667,24 +495,19 @@
     const candidates = document.querySelectorAll(
       "[role='dialog'], [aria-live='polite'], [aria-live='assertive'], section, article"
     );
-    let sawPrediction = false;
 
+    // inspectPredictionText -> notePredictionSeen refreshes predictionLastSeenAt
+    // whenever a prediction is found, which keeps the presence timer alive.
     for (const candidate of candidates) {
       const result = inspectPredictionText(
         candidate.textContent || "",
         candidate.getAttribute("role") || candidate.tagName.toLowerCase()
       );
-      if (result.seen) {
-        sawPrediction = true;
-      }
       if (result.shouldAlert) {
         return true;
       }
     }
 
-    if (!sawPrediction) {
-      handleMissingPrediction(Date.now());
-    }
     return false;
   }
 
